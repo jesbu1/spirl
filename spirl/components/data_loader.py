@@ -323,3 +323,142 @@ class RandomVideoDataset(GeneratedVideoDataset):
         data_dict.actions = np.random.rand(self.spec['max_seq_len'] - 1, self.spec['n_actions']).astype(np.float32)
 
         return data_dict
+
+class ProgramDataset(Dataset):
+    """Face Landmarks dataset."""
+
+    #def __init__(self, program_list, config, num_program_tokens, num_agent_actions, device):
+    def __init__(self, data_dir, data_conf, phase, shuffle=True, dataset_size=-1):
+        """
+        config:
+            csv_file (string): Path to the csv file with annotations.
+            root_dir (string): Directory with all the images.
+            transform (callable, optional): Optional transform to be applied
+                on a sample.
+        """
+        #self.device = device
+        #self.config = config
+        #self.programs = program_list
+        ## need this +1 as DEF token is input to decoder, loss will be calculated only from run token
+        #self.max_program_len = config['dsl']['max_program_len'] + 1
+        #self.num_program_tokens = num_program_tokens
+        #self.num_agent_actions = num_agent_actions
+        self.phase = phase
+        self.data_dir = data_dir
+        self.spec = data_conf.dataset_spec
+        self.dataset_size = dataset_size
+        self.device = data_conf.device
+
+        print('loading files from', self.data_dir)
+        self.filenames = self._get_filenames()
+        self.samples_per_file = self._get_samples_per_file(self.filenames[0])
+
+        self.shuffle = shuffle and phase == 'train'
+        self.n_worker = 8 if shuffle else 1  # was 4 before
+
+    def _dsl_to_prl(self, program_seq):
+        def func(x):
+            return self.config['prl_tokens'].index(self.config['dsl2prl_mapping'][self.config['dsl_tokens'][x]])
+        return np.array(list(map(func, program_seq)), program_seq.dtype)
+
+    def __len__(self):
+        return len(self.programs)
+
+    def __getitem__(self, idx):
+
+        program_id, sample, exec_data = self.programs[idx]
+        sample = self._dsl_to_prl(sample) if self.config['use_simplified_dsl'] else sample
+
+        sample = torch.from_numpy(sample).to(self.device).to(torch.long)
+        program_len = sample.shape[0]
+        sample_filler = torch.tensor((self.max_program_len - program_len) * [self.num_program_tokens - 1],
+                                     device=self.device, dtype=torch.long)
+        sample = torch.cat((sample, sample_filler))
+
+        #one_hot_sample = torch.zeros((self.max_program_len, self.num_program_tokens),
+        #                             device=self.device, dtype=torch.float32)
+        #one_hot_sample[torch.arange(self.max_program_len), sample.long().squeeze()] = 1.0
+
+        mask = torch.zeros((self.max_program_len, 1), device=self.device, dtype=torch.bool)
+        mask[:program_len] = 1
+
+        # load exec data
+        s_h, a_h, a_h_len = exec_data
+        s_h = torch.tensor(s_h, device=self.device, dtype=torch.float32)
+        a_h = torch.tensor(a_h, device=self.device, dtype=torch.int16)
+        a_h_len = torch.tensor(a_h_len, device=self.device, dtype=torch.int16)
+
+        packed_a_h = rnn.pack_padded_sequence(a_h, a_h_len, batch_first=True, enforce_sorted=False)
+        padded_a_h, a_h_len = rnn.pad_packed_sequence(packed_a_h, batch_first=True,
+                                                      padding_value=self.num_agent_actions-1,
+                                                      total_length=self.config['max_demo_length'] - 1)
+        # packed_a_h = rnn.pack_padded_sequence(padded_a_h, a_h_len, batch_first=True, enforce_sorted=False)
+
+        return sample, program_id, mask, s_h, padded_a_h, a_h_len.to(self.device)
+
+
+def get_exec_data(hdf5_file, program_id):
+    def func(x):
+        s_h, s_h_len = x
+        # return np.stack((s_h[0], s_h[s_h_len-1]))
+        return np.expand_dims(s_h[0], 0)
+
+    s_h = np.moveaxis(hdf5_file[program_id]['s_h'], [-1,-2,-3], [-3,-1,-2])
+    a_h = hdf5_file[program_id]['a_h']
+    s_h_len = hdf5_file[program_id]['s_h_len']
+    a_h_len = hdf5_file[program_id]['a_h_len']
+
+    # select input/output pairs from demonstration executions
+    #with Pool() as p:
+    results = map(func, zip(s_h, s_h_len))
+    s_h = np.stack(list(results))
+    # exec_data.s_h = list(chain.from_iterable(value_exec_data[2]))
+    return s_h, a_h, a_h_len
+
+def make_datasets(datadir, config, num_program_tokens, num_agent_actions, device, logger):
+
+    hdf5_file = h5py.File(os.path.join(datadir, 'data.hdf5'), 'r')
+    id_file = open(os.path.join(datadir, 'id.txt'), 'r')
+
+    logger.debug('loading programs from karel demo2program dataset:')
+    program_list = []
+    id_list = id_file.readlines()
+    for program_id in (id_list):
+        program_id = program_id.strip()
+        program = hdf5_file[program_id]['program'][()]
+        exec_data = get_exec_data(hdf5_file, program_id)
+        if program.shape[0] < config['dsl']['max_program_len']:
+            program_list.append((program_id, program, exec_data))
+    id_file.close()
+    logger.debug('Total programs with length <= {}: {}'.format(config['dsl']['max_program_len'], len(program_list)))
+
+    random.shuffle(program_list)
+
+    train_r, val_r, test_r = 0.7, 0.15, 0.15
+    split_idx1 = int(train_r*len(program_list))
+    split_idx2 = int((train_r+val_r)*len(program_list))
+    train_program_list = program_list[:split_idx1]
+    valid_program_list = program_list[split_idx1:split_idx2]
+    test_program_list = program_list[split_idx2:]
+
+    train_dataset = ProgramDataset(train_program_list, config, num_program_tokens, num_agent_actions, device)
+    val_dataset = ProgramDataset(valid_program_list, config, num_program_tokens, num_agent_actions, device)
+    test_dataset = ProgramDataset(test_program_list, config, num_program_tokens, num_agent_actions, device)
+    return train_dataset, val_dataset, test_dataset
+
+
+def run(config, logger):
+    # write the code to load the dataset and initiate the dataloader
+    p_train_dataset, p_val_dataset, p_test_dataset = make_datasets(config['datadir'], config,
+                                                                   model.num_program_tokens,
+                                                                   config['dsl']['num_agent_actions'], device, logger)
+    config_tr = config['train']
+    config_val = config['valid']
+    config_test = config['test']
+    config_eval = config['eval']
+    p_train_dataloader = DataLoader(p_train_dataset, batch_size=config_tr['batch_size'],
+                                    shuffle=config_tr['shuffle'], **config['data_loader'])
+    p_val_dataloader = DataLoader(p_val_dataset, batch_size=config_val['batch_size'],
+                                  shuffle=config_val['shuffle'], **config['data_loader'])
+    p_test_dataloader = DataLoader(p_test_dataset, batch_size=config_test['batch_size'],
+                                  shuffle=config_val['shuffle'], **config['data_loader'])

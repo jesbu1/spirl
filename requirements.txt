@@ -2,13 +2,13 @@
 numpy
 matplotlib
 pillow
-h5py==2.10.0
+h5py
 scikit-image
 funcsigs
 opencv-python
 moviepy
-torch
-torchvision
+torch==1.4.0
+torchvision==0.5.0
 tensorboard
 tensorboardX
 gym==0.15.4

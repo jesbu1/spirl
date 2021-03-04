@@ -451,13 +451,13 @@ class ProgramDataset(Dataset):
 
         # load exec data
         #s_h = torch.tensor(s_h, device=self.device, dtype=torch.float32)
-        a_h = torch.tensor(a_h, device=self.device, dtype=torch.int64)
+        a_h = torch.tensor(a_h, dtype=torch.int64)
         #print(a_h)
         stop_action = torch.zeros_like(a_h)
         stop_action[..., 0] = self.num_actions
         a_h = torch.cat((a_h, stop_action[..., :1]), dim=-1)
         #print(a_h)
-        a_h_len = torch.tensor(a_h_len, device=self.device, dtype=torch.int16)
+        a_h_len = torch.tensor(a_h_len, dtype=torch.int16)
         a_h_len += 1
         packed_a_h = rnn.pack_padded_sequence(a_h, a_h_len, batch_first=True, enforce_sorted=False)
         padded_a_h, a_h_len = rnn.pad_packed_sequence(packed_a_h, batch_first=True,
@@ -467,7 +467,7 @@ class ProgramDataset(Dataset):
         #print(padded_a_h)
         rand = random.randint(0, 9)
         data.actions = padded_a_h[rand].unsqueeze(-1)
-        data.lengths = a_h_len.to(self.device)[rand].unsqueeze(-1)
+        data.lengths = a_h_len[rand].unsqueeze(-1)
         return data
 
 

@@ -5,7 +5,9 @@ import random
 import h5py
 import numpy as np
 import torch.utils.data as data
+import torch.nn.utils.rnn as rnn
 import itertools
+import torch
 
 from spirl.utils.general_utils import AttrDict, map_dict, maybe_retrieve, shuffle_with_seed
 from spirl.utils.pytorch_utils import RepeatedDataLoader
@@ -327,8 +329,28 @@ class RandomVideoDataset(GeneratedVideoDataset):
 class ProgramDataset(Dataset):
     """Face Landmarks dataset."""
 
-    #def __init__(self, program_list, config, num_program_tokens, num_agent_actions, device):
-    def __init__(self, data_dir, data_conf, phase, shuffle=True, dataset_size=-1):
+    def __getitem__(self, index):
+        """Load a single sequence from disk according to index."""
+        raise NotImplementedError("Needs to be implemented in sub-class!")
+
+    def _get_filenames(self):
+        """Loads filenames from self.data_dir, expects subfolders train/val/test, each with hdf5 files"""
+        filenames = sorted(glob.glob(os.path.join(self.data_dir, self.phase + '/*.h5')))
+        if not filenames:
+            raise RuntimeError('No filenames found in {}'.format(self.data_dir))
+        filenames = shuffle_with_seed(filenames)
+        return filenames
+
+
+    # old functions
+    def get_data_loader(self, batch_size, n_repeat):
+        print('len {} dataset {}'.format(self.phase, len(self)))
+        assert self.device in ['cuda', 'cpu']  # Otherwise the logic below is wrong
+        return RepeatedDataLoader(self, batch_size=batch_size, shuffle=self.shuffle, num_workers=self.n_worker,
+                                  drop_last=True, n_repeat=n_repeat, pin_memory=self.device == 'cuda',
+                                  worker_init_fn=lambda x: np.random.seed(np.random.randint(65536) + x))
+    
+    def __init__(self, data_dir, data_conf, phase, shuffle=True, dataset_size=-1, resolution=None):
         """
         config:
             csv_file (string): Path to the csv file with annotations.
@@ -350,115 +372,119 @@ class ProgramDataset(Dataset):
         self.device = data_conf.device
 
         print('loading files from', self.data_dir)
-        self.filenames = self._get_filenames()
-        self.samples_per_file = self._get_samples_per_file(self.filenames[0])
+        programs = self.make_datasets(self.data_dir)
+        self.program_list= programs
+        #train_actions, train_actions_lens = data.train
+        #val_actions, val_actions_lens = data.val
+        #test_actions, test_actions_lens = data.test
+        #if self.phase == 'train':
+        #    self.action_list, self.action_lens = train_actions, train_actions_lens
+        #if self.phase == 'val':
+        #    self.action_list, self.action_lens = val_actions, val_actions_lens
+        #if self.phase == 'test':
+        #    self.action_list, self.action_lens = test_actions, test_actions_lens
 
         self.shuffle = shuffle and phase == 'train'
+        #def shuffle(a,b):
+        #    assert len(a) == len(b)
+        #    start_state = random.getstate()
+        #    random.shuffle(a)
+        #    random.setstate(start_state)
+        #    random.shuffle(b)
+        if self.shuffle:
+            #shuffle(self.action_list, self.action_lens)
+            random.shuffle(self.program_list)
         self.n_worker = 8 if shuffle else 1  # was 4 before
+        self.num_actions = 5
+    
+    def make_datasets(self, datadir):
 
-    def _dsl_to_prl(self, program_seq):
-        def func(x):
-            return self.config['prl_tokens'].index(self.config['dsl2prl_mapping'][self.config['dsl_tokens'][x]])
-        return np.array(list(map(func, program_seq)), program_seq.dtype)
+        self.hdf5_file = h5py.File(os.path.join(datadir, 'data.hdf5'), 'r')
+        id_file = open(os.path.join(datadir, 'id.txt'), 'r')
 
+        print('loading demos from karel demo2program dataset:')
+        #action_list = []
+        action_lens = []
+        program_list = []
+        id_list = id_file.readlines()
+        for program_id in (id_list):
+            program_id = program_id.strip()
+            program_list.append(program_id)
+            #s_h, a_h, a_h_len = self.get_exec_data(hdf5_file, program_id)
+            #action_list.append(a_h)
+            #action_lens.append(a_h_len)
+        id_file.close()
+
+        #random.shuffle(program_list)
+
+        train_r, val_r, test_r = 0.7, 0.15, 0.15
+        split_idx1 = int(train_r*len(program_list))
+        split_idx2 = int((train_r+val_r)*len(program_list))
+        train_program_list = program_list[:split_idx1]
+        val_program_list = program_list[split_idx1:split_idx2]
+        test_program_list = program_list[split_idx2:]
+        #train_action_list, train_action_lens = action_list[:split_idx1], action_lens[:split_idx1]
+        #valid_action_list, valid_action_lens = action_list[split_idx1:split_idx2], action_lens[split_idx1:split_idx2]
+        #test_action_list, test_action_lens = action_list[split_idx2:], action_lens[split_idx2:]
+        if self.phase == "train":
+            return train_program_list
+        elif self.phase == "val":
+            return val_program_list
+        else:
+            return test_program_list
+        #return AttrDict(train=(train_action_list, train_action_lens), valid=(valid_action_list, valid_action_lens), test=(test_action_list, test_action_lens)), program_list
+    
     def __len__(self):
-        return len(self.programs)
+        return len(self.program_list)
+
+    def _load_action_from_program(self, idx):
+        program_id = self.program_list[idx]
+        s_h, a_h, a_h_len = self.get_exec_data(self.hdf5_file, program_id)
+        return a_h, a_h_len
 
     def __getitem__(self, idx):
-
-        program_id, sample, exec_data = self.programs[idx]
-        sample = self._dsl_to_prl(sample) if self.config['use_simplified_dsl'] else sample
-
-        sample = torch.from_numpy(sample).to(self.device).to(torch.long)
-        program_len = sample.shape[0]
-        sample_filler = torch.tensor((self.max_program_len - program_len) * [self.num_program_tokens - 1],
-                                     device=self.device, dtype=torch.long)
-        sample = torch.cat((sample, sample_filler))
-
-        #one_hot_sample = torch.zeros((self.max_program_len, self.num_program_tokens),
-        #                             device=self.device, dtype=torch.float32)
-        #one_hot_sample[torch.arange(self.max_program_len), sample.long().squeeze()] = 1.0
-
-        mask = torch.zeros((self.max_program_len, 1), device=self.device, dtype=torch.bool)
-        mask[:program_len] = 1
+        data = AttrDict()
+        a_h, a_h_len = self._load_action_from_program(idx)
+        #sample_filler = torch.tensor((self.max_program_len - program_len) * [self.num_program_tokens - 1],
+        #                             device=self.device, dtype=torch.long)
+        #sample = torch.cat((sample, sample_filler))
 
         # load exec data
-        s_h, a_h, a_h_len = exec_data
-        s_h = torch.tensor(s_h, device=self.device, dtype=torch.float32)
-        a_h = torch.tensor(a_h, device=self.device, dtype=torch.int16)
+        #s_h = torch.tensor(s_h, device=self.device, dtype=torch.float32)
+        a_h = torch.tensor(a_h, device=self.device, dtype=torch.int64)
+        #print(a_h)
+        stop_action = torch.zeros_like(a_h)
+        stop_action[..., 0] = self.num_actions
+        a_h = torch.cat((a_h, stop_action[..., :1]), dim=-1)
+        #print(a_h)
         a_h_len = torch.tensor(a_h_len, device=self.device, dtype=torch.int16)
-
+        a_h_len += 1
         packed_a_h = rnn.pack_padded_sequence(a_h, a_h_len, batch_first=True, enforce_sorted=False)
         padded_a_h, a_h_len = rnn.pad_packed_sequence(packed_a_h, batch_first=True,
-                                                      padding_value=self.num_agent_actions-1,
-                                                      total_length=self.config['max_demo_length'] - 1)
+                                                      padding_value=self.num_actions,
+                                                      total_length=20)
         # packed_a_h = rnn.pack_padded_sequence(padded_a_h, a_h_len, batch_first=True, enforce_sorted=False)
-
-        return sample, program_id, mask, s_h, padded_a_h, a_h_len.to(self.device)
-
-
-def get_exec_data(hdf5_file, program_id):
-    def func(x):
-        s_h, s_h_len = x
-        # return np.stack((s_h[0], s_h[s_h_len-1]))
-        return np.expand_dims(s_h[0], 0)
-
-    s_h = np.moveaxis(hdf5_file[program_id]['s_h'], [-1,-2,-3], [-3,-1,-2])
-    a_h = hdf5_file[program_id]['a_h']
-    s_h_len = hdf5_file[program_id]['s_h_len']
-    a_h_len = hdf5_file[program_id]['a_h_len']
-
-    # select input/output pairs from demonstration executions
-    #with Pool() as p:
-    results = map(func, zip(s_h, s_h_len))
-    s_h = np.stack(list(results))
-    # exec_data.s_h = list(chain.from_iterable(value_exec_data[2]))
-    return s_h, a_h, a_h_len
-
-def make_datasets(datadir, config, num_program_tokens, num_agent_actions, device, logger):
-
-    hdf5_file = h5py.File(os.path.join(datadir, 'data.hdf5'), 'r')
-    id_file = open(os.path.join(datadir, 'id.txt'), 'r')
-
-    logger.debug('loading programs from karel demo2program dataset:')
-    program_list = []
-    id_list = id_file.readlines()
-    for program_id in (id_list):
-        program_id = program_id.strip()
-        program = hdf5_file[program_id]['program'][()]
-        exec_data = get_exec_data(hdf5_file, program_id)
-        if program.shape[0] < config['dsl']['max_program_len']:
-            program_list.append((program_id, program, exec_data))
-    id_file.close()
-    logger.debug('Total programs with length <= {}: {}'.format(config['dsl']['max_program_len'], len(program_list)))
-
-    random.shuffle(program_list)
-
-    train_r, val_r, test_r = 0.7, 0.15, 0.15
-    split_idx1 = int(train_r*len(program_list))
-    split_idx2 = int((train_r+val_r)*len(program_list))
-    train_program_list = program_list[:split_idx1]
-    valid_program_list = program_list[split_idx1:split_idx2]
-    test_program_list = program_list[split_idx2:]
-
-    train_dataset = ProgramDataset(train_program_list, config, num_program_tokens, num_agent_actions, device)
-    val_dataset = ProgramDataset(valid_program_list, config, num_program_tokens, num_agent_actions, device)
-    test_dataset = ProgramDataset(test_program_list, config, num_program_tokens, num_agent_actions, device)
-    return train_dataset, val_dataset, test_dataset
+        #print(padded_a_h)
+        rand = random.randint(0, 9)
+        data.actions = padded_a_h[rand].unsqueeze(-1)
+        data.lengths = a_h_len.to(self.device)[rand].unsqueeze(-1)
+        return data
 
 
-def run(config, logger):
-    # write the code to load the dataset and initiate the dataloader
-    p_train_dataset, p_val_dataset, p_test_dataset = make_datasets(config['datadir'], config,
-                                                                   model.num_program_tokens,
-                                                                   config['dsl']['num_agent_actions'], device, logger)
-    config_tr = config['train']
-    config_val = config['valid']
-    config_test = config['test']
-    config_eval = config['eval']
-    p_train_dataloader = DataLoader(p_train_dataset, batch_size=config_tr['batch_size'],
-                                    shuffle=config_tr['shuffle'], **config['data_loader'])
-    p_val_dataloader = DataLoader(p_val_dataset, batch_size=config_val['batch_size'],
-                                  shuffle=config_val['shuffle'], **config['data_loader'])
-    p_test_dataloader = DataLoader(p_test_dataset, batch_size=config_test['batch_size'],
-                                  shuffle=config_val['shuffle'], **config['data_loader'])
+    def get_exec_data(self, hdf5_file, program_id):
+        def func(x):
+            s_h, s_h_len = x
+            # return np.stack((s_h[0], s_h[s_h_len-1]))
+            return np.expand_dims(s_h[0], 0)
+        #program_id = program_id.encode('utf-8')
+        s_h = np.moveaxis(hdf5_file[program_id]['s_h'], [-1,-2,-3], [-3,-1,-2])
+        a_h = hdf5_file[program_id]['a_h']
+        s_h_len = hdf5_file[program_id]['s_h_len']
+        a_h_len = hdf5_file[program_id]['a_h_len']
+
+        # select input/output pairs from demonstration executions
+        #with Pool() as p:
+        results = map(func, zip(s_h, s_h_len))
+        s_h = np.stack(list(results))
+        # exec_data.s_h = list(chain.from_iterable(value_exec_data[2]))
+        return s_h, a_h, a_h_len

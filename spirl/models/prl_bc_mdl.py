@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import copy
 
 from spirl.components.base_model import BaseModel
@@ -50,14 +51,14 @@ class BCMdl(BaseModel):
         assert self._hp.output_type == 'gauss'  # currently only support unimodal output
         #self.net = Predictor(self._hp, input_size=self._hp.state_dim, output_size=self._hp.action_dim * 2)
         self.p = nn.Sequential(
-            nn.LSTM(input_size=self._hp.action_dim, hidden_dim=self._hp.nz_mid, num_layers=1),
+            nn.LSTM(input_size=self._hp.nz_vae, hidden_size=self._hp.nz_mid, num_layers=2),
             SelectItem(0),
-            nn.Linear(self._hp.nz_mid, self._hp.action_dim)
+            nn.Linear(self._hp.nz_mid, self._hp.action_dim + 1)
         )
         self.q = nn.Sequential(
-            nn.LSTM(input_size=self._hp.action_dim, hidden_dim=self._hp.nz_mid, num_layers=1, bidirectional=True),
+            nn.LSTM(input_size=self._hp.action_dim + 1, hidden_size=self._hp.nz_mid, num_layers=2, bidirectional=True),
             SelectItem(0),
-            nn.Linear(self._hp.nz_mid, self._hp.nz_vae * 2)
+            nn.Linear(self._hp.nz_mid * 2, self._hp.nz_vae * 2)
         )
 
     def forward(self, inputs, use_learned_prior=False):
@@ -65,11 +66,13 @@ class BCMdl(BaseModel):
         forward pass at training time
         """ 
         output = AttrDict()
-        output.q = self._run_inference(self._net_inputs(inputs))
+        inputs.observations = inputs.actions # for seamless evaluation
+        output.q = self._run_inference(F.one_hot(self._net_inputs(inputs), num_classes=self._hp.action_dim+1).squeeze(-2).float())
         
         sampled_latent = output.q.rsample()
 
         output.pred_act = self._compute_output_dist(sampled_latent) # outputs logits
+        output.reconstruction = output.pred_act.sample()
         return output
 
     def _run_inference(self, inputs):
@@ -82,16 +85,16 @@ class BCMdl(BaseModel):
         losses = AttrDict()
 
         # reconstruction loss
-        losses.nll = - torch.distributions.Categortical(model_output.pred_act).log_prob(self._regression_targets(inputs)) * inputs.valid_mask #NLL()(model_output.pred_act, self._regression_targets(inputs))
+        losses.nll = AttrDict(value=-model_output.pred_act.log_prob(self._regression_targets(inputs).squeeze(-1)).mean(), weight=1.0) #NLL()(model_output.pred_act, self._regression_targets(inputs))
 
-        fixed_prior = torch.distributions.Normal(loc=torch.zeros_like(model_output.q), scale=torch.ones_like(model_output.q))
-        losses.kl_loss = AttrDict(value=torch.distributions.kl.kl_divergence(model_output.q, fixed_prior), weight=self._hp.beta)
+        fixed_prior = torch.distributions.Normal(loc=torch.zeros_like(model_output.q.loc), scale=torch.ones_like(model_output.q.loc))
+        losses.kl_loss = AttrDict(value=torch.distributions.kl.kl_divergence(model_output.q, fixed_prior).mean(), weight=self._hp.beta)
 
         losses.total = self._compute_total_loss(losses)
         return losses
 
     def _compute_output_dist(self, inputs):
-        return torch.distributions.Categorical(self.net(inputs))
+        return torch.distributions.Categorical(logits=self.p(inputs))
 
     def _net_inputs(self, inputs):
         return inputs.actions

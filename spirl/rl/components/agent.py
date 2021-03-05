@@ -342,3 +342,12 @@ class FixedIntervalHierarchicalAgent(HierarchicalAgent):
     def reset(self):
         super().reset()
         self._steps_since_hl = 0     # start new episode with high-level step
+
+class MixedIntervalHierarchicalAgent(HierarchicalAgent):
+    """Hierarchical agent that executes high-level actions at temporal intervals determined by the lower level policy."""
+    def __init__(self, config):
+        super().__init__(config)
+    
+    @property
+    def _perform_hl_step_now(self):
+        return len(self.ll_agent.action_plan) == 0

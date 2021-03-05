@@ -102,7 +102,7 @@ class ModelTrainer(BaseTrainer):
         for epoch in range(start_epoch, self._hp.num_epochs):
             self.train_epoch(epoch)
         
-            if not self.args.dont_save:
+            if not self.args.dont_save and epoch % 10 == 0:
                 save_checkpoint({
                     'epoch': epoch,
                     'global_step': self.global_step,

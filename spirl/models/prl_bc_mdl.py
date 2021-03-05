@@ -5,7 +5,9 @@ import torch.nn.functional as F
 import copy
 
 from spirl.components.base_model import BaseModel
+from spirl.utils.pytorch_utils import map2np, ten2ar, RemoveSpatial, ResizeSpatial, map2torch, find_tensor
 from spirl.utils.general_utils import AttrDict, ParamDict
+from spirl.modules.recurrent_modules import RecurrentPredictor
 #from spirl.utils.pytorch_utils import RemoveSpatial, ResizeSpatial
 from spirl.modules.variational_inference import ProbabilisticModel, MultivariateGaussian
 
@@ -39,6 +41,8 @@ class BCMdl(BaseModel):
             'state_dim': 1,             # dimensionality of the state space
             'action_dim': 1,            # dimensionality of the action space
             'nz_mid': 128,              # number of dimensions for internal feature spaces
+            'nz_mid_lstm': 128,              # number of dimensions for internal feature spaces
+            'n_lstm_layers': 1,              # number of dimensions for internal feature spaces
             'nz_vae': 5,              # number of dimensions for internal feature spaces
             'n_processing_layers': 5,   # number of layers in MLPs
             'output_type': 'gauss',     # distribution type for learned prior, ['gauss', 'gmm', 'flow']
@@ -50,11 +54,16 @@ class BCMdl(BaseModel):
         assert not self._hp.use_convs   # currently only supports non-image inputs
         assert self._hp.output_type == 'gauss'  # currently only support unimodal output
         #self.net = Predictor(self._hp, input_size=self._hp.state_dim, output_size=self._hp.action_dim * 2)
-        self.p = nn.Sequential(
-            nn.LSTM(input_size=self._hp.nz_vae, hidden_size=self._hp.nz_mid, num_layers=2),
-            SelectItem(0),
-            nn.Linear(self._hp.nz_mid, self._hp.action_dim + 1)
-        )
+        #self.p = nn.Sequential(
+        #    nn.LSTM(input_size=self._hp.nz_vae, hidden_size=self._hp.nz_mid, num_layers=2),
+        #    SelectItem(0),
+        #    nn.Linear(self._hp.nz_mid, self._hp.action_dim + 1)
+        #)
+        self.p = RecurrentPredictor(self._hp,
+                                          input_size=self._hp.action_dim+1+self._hp.nz_vae,
+                                          output_size=self._hp.action_dim + 1)
+        self.decoder_input_initalizer = self._build_decoder_initializer(size=self._hp.action_dim + 1)
+        self.decoder_hidden_initalizer = self._build_decoder_initializer(size=self.p.cell.get_state_size())
         self.q = nn.Sequential(
             nn.LSTM(input_size=self._hp.action_dim + 1, hidden_size=self._hp.nz_mid, num_layers=2, bidirectional=True),
             SelectItem(0),
@@ -71,12 +80,24 @@ class BCMdl(BaseModel):
         
         sampled_latent = output.q.rsample()
 
-        output.pred_act = self._compute_output_dist(sampled_latent) # outputs logits
+        output.pred_act = self._compute_output_dist(sampled_latent, cond_inputs=inputs.actions[:, 0], steps=inputs.actions.shape[1]) # outputs logits
         output.reconstruction = output.pred_act.sample()
         return output
-
+    
+    def decode(self, z, cond_inputs, steps):
+        """Runs forward pass of decoder given skill embedding.
+        :arg z: skill embedding
+        :arg cond_inputs: info that decoder is conditioned on
+        :arg steps: number of steps decoder is rolled out
+        """
+        pred_act = self._compute_output_dist(z, cond_inputs=cond_inputs.actions[:, 0], steps=steps)
+        reconstruction = torch.argmax(pred_act)
+        stop_time = (reconstruction == self._hp.action_dim).nonzero(as_tuple=True)[0]
+        reconstruction = reconstruction[:, :stop_time]
+        return reconstruction
+    
     def _run_inference(self, inputs):
-        z = self.q(inputs)
+        z = self.q(inputs)[:, -1]
         normal = torch.distributions.Normal(loc=z[..., :self._hp.nz_vae], scale=torch.clamp(z[..., self._hp.nz_vae:], min=-10, max=2).exp())
         return normal
 
@@ -93,8 +114,14 @@ class BCMdl(BaseModel):
         losses.total = self._compute_total_loss(losses)
         return losses
 
-    def _compute_output_dist(self, inputs):
-        return torch.distributions.Categorical(logits=self.p(inputs))
+    def _compute_output_dist(self, z, cond_inputs, steps):
+        lstm_init_input = self.decoder_input_initalizer(cond_inputs)
+        lstm_init_hidden = self.decoder_hidden_initalizer(cond_inputs)
+        decoder_pred = self.p(lstm_initial_inputs=AttrDict(x_t=lstm_init_input),
+                                lstm_static_inputs=AttrDict(z=z),
+                                steps=steps,
+                                lstm_hidden_init=lstm_init_hidden).pred
+        return torch.distributions.Categorical(logits=decoder_pred)
 
     def _net_inputs(self, inputs):
         return inputs.actions
@@ -119,3 +146,14 @@ class BCMdl(BaseModel):
         pass
         yield
         pass
+
+    def _build_decoder_initializer(self, size):
+        class FixedTrainableInitializer(nn.Module):
+            def __init__(self, hp):
+                super().__init__()
+                self._hp = hp
+                self.val = torch.zeros((1, size), requires_grad=True, device=self._hp.device)
+
+            def forward(self, state):
+                return self.val.repeat(find_tensor(state).shape[0], 1)
+        return FixedTrainableInitializer(self._hp)

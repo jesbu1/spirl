@@ -1,0 +1,3 @@
+[submodule "spirl/rl/envs/pytorch-a2c-ppo-acktr-gail"]
+	path = spirl/rl/envs/pytorch-a2c-ppo-acktr-gail
+	url = git@github.com:dweeptrivedi/pytorch-a2c-ppo-acktr-gail.git

@@ -68,7 +68,7 @@ ll_agent_config.update(AttrDict(
     model=SkillPriorMdl,
     model_params=ll_model_params,
     model_checkpoint=os.path.join(os.environ["EXP_DIR"],
-                                  "skill_prior_learning/kitchen/hierarchical"),
+                                  "skill_prior_learning/program/flat"),
 ))
 
 

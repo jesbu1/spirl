@@ -23,12 +23,12 @@ class KarelEnv(GymEnv):
                 incorrect_marker_penalty=config.incorrect_marker_penalty,
                 delayed_reward=config.delayed_reward,
                 seed=random.randint(0, 100000000))
-        self.env = KarelGymEnv()
+        env_args = {}
+        self.env = KarelGymEnv(env_args.update(args))
         self.observation_space = self.env.observation_space
         self.reward_range = self.env.reward_range
         self.metadata = self.env.metadata
         self.spec = getattr(self.env, 'spec', None)
-        config.subtask
 
     def _default_hparams(self):
         return super()._default_hparams().overwrite(ParamDict({
@@ -40,4 +40,10 @@ class KarelEnv(GymEnv):
         return obs, np.float64(rew), done, self._postprocess_info(info)     # casting reward to float64 is important for getting shape later
 
     def reset(self):
+        ob = self.observation()
         return super().reset()
+
+    def observation(self, ob):
+        if len(self.observation_space.shape) == 3:
+            return np.transpose(ob, (self.op[0], self.op[1], self.op[2]))
+        return ob

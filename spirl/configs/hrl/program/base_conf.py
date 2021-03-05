@@ -10,8 +10,9 @@ from spirl.rl.components.sampler import HierarchicalSampler
 from spirl.rl.components.replay_buffer import UniformReplayBuffer
 from spirl.rl.agents.ac_agent import SACAgent
 from spirl.rl.agents.skill_space_agent import SkillSpaceAgent
-from spirl.models.skill_prior_mdl import SkillPriorMdl
-from spirl.configs.default_data_configs.kitchen import data_spec
+#from spirl.models.skill_prior_mdl import SkillPriorMdl
+from spirl.models.prl_bc_mdl import BCMdl
+from spirl.configs.default_data_configs.prl import data_spec
 
 current_dir = os.path.dirname(os.path.realpath(__file__))
 
@@ -23,9 +24,9 @@ configuration = {
     'environment': KarelEnv,
     'sampler': HierarchicalSampler,
     'data_dir': '.',
-    'num_epochs': 100,
-    'max_rollout_len': 280,
-    'n_steps_per_epoch': 100000,
+    'num_epochs': 1,
+    'max_rollout_len': 100,
+    'n_steps_per_epoch': 1000000,
     'n_warmup_steps': 5e3,
 }
 configuration = AttrDict(configuration)
@@ -38,7 +39,7 @@ replay_params = AttrDict(
 # Observation Normalization
 obs_norm_params = AttrDict(
 )
-
+state_dim=5 #16
 base_agent_params = AttrDict(
     batch_size=256,
     replay=UniformReplayBuffer,
@@ -52,12 +53,13 @@ base_agent_params = AttrDict(
 ###### Low-Level ######
 # LL Policy
 ll_model_params = AttrDict(
-    state_dim=data_spec.state_dim,
+    state_dim=state_dim,
     action_dim=data_spec.n_actions,
-    kl_div_weight=5e-4,
+    kl_div_weight=1.0,
     nz_enc=128,
     nz_mid=128,
-    n_processing_layers=5,
+    input_res=data_spec.res,
+    #n_processing_layers=5,
     nz_vae=5,
     n_rollout_steps=20,
 )
@@ -65,10 +67,10 @@ ll_model_params = AttrDict(
 # LL Agent
 ll_agent_config = copy.deepcopy(base_agent_params)
 ll_agent_config.update(AttrDict(
-    model=SkillPriorMdl,
+    model=BCMdl,
     model_params=ll_model_params,
     model_checkpoint=os.path.join(os.environ["EXP_DIR"],
-                                  "skill_prior_learning/program/flat"),
+                                  "skill_prior_learning/program/flat/beta_1.0"),
 ))
 
 
@@ -76,7 +78,7 @@ ll_agent_config.update(AttrDict(
 # HL Policy
 hl_policy_params = AttrDict(
     action_dim=ll_model_params.nz_vae,       # z-dimension of the skill VAE
-    input_dim=data_spec.state_dim,
+    input_dim=state_dim,
     max_action_range=2.,        # prior is Gaussian with unit variance
     nz_mid=256,
     n_layers=5,
@@ -119,7 +121,7 @@ data_config.dataset_spec = data_spec
 # Environment
 env_config = AttrDict(
     reward_norm=1.,
-    subtask='fourCorner',
+    subtask='fourCorners',
     obv_type='local',
     height=12,
     width=12,
@@ -127,4 +129,3 @@ env_config = AttrDict(
     delayed_reward=True,
     max_episode_steps=configuration.max_rollout_len,
 )
-

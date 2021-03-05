@@ -90,10 +90,13 @@ class BCMdl(BaseModel):
         :arg cond_inputs: info that decoder is conditioned on
         :arg steps: number of steps decoder is rolled out
         """
-        pred_act = self._compute_output_dist(z, cond_inputs=cond_inputs.actions[:, 0], steps=steps)
-        reconstruction = torch.argmax(pred_act)
-        stop_time = (reconstruction == self._hp.action_dim).nonzero(as_tuple=True)[0]
-        reconstruction = reconstruction[:, :stop_time]
+        pred_act = self._compute_output_dist(z, cond_inputs=cond_inputs, steps=steps)
+        reconstruction = torch.argmax(pred_act.logits, -1)
+        stop_time = reconstruction == self._hp.action_dim
+        for t in range(steps):
+            if stop_time[0, t].item():
+                break
+        reconstruction = reconstruction[:, :t]
         return reconstruction
     
     def _run_inference(self, inputs):
@@ -139,7 +142,23 @@ class BCMdl(BaseModel):
 
     @property
     def resolution(self):
-        return 64  # return dummy resolution, images are not used by this model
+        return 64       # return dummy resolution, images are not used by this model
+
+    @property
+    def latent_dim(self):
+        return self._hp.nz_vae
+
+    @property
+    def state_dim(self):
+        return self._hp.state_dim
+
+    @property
+    def prior_input_size(self):
+        return self.state_dim
+
+    @property
+    def n_rollout_steps(self):
+        return self._hp.n_rollout_steps
 
     @contextmanager
     def val_mode(self):

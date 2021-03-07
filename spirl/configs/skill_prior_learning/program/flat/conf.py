@@ -24,7 +24,7 @@ model_config = AttrDict(
     action_dim=data_spec.n_actions,
     input_res=data_spec.res,
     n_input_frames=1,
-    beta=1,
+    beta=5,
 )
 
 # Dataset

@@ -7,7 +7,7 @@ import copy
 from spirl.components.base_model import BaseModel
 from spirl.utils.pytorch_utils import map2np, ten2ar, RemoveSpatial, ResizeSpatial, map2torch, find_tensor
 from spirl.utils.general_utils import AttrDict, ParamDict
-from spirl.modules.recurrent_modules import RecurrentPredictor
+from spirl.modules.recurrent_modules import RecurrentPredictorTeacherEnforced, RecurrentPredictor
 #from spirl.utils.pytorch_utils import RemoveSpatial, ResizeSpatial
 from spirl.modules.variational_inference import ProbabilisticModel, MultivariateGaussian
 
@@ -59,7 +59,9 @@ class BCMdl(BaseModel):
         #    SelectItem(0),
         #    nn.Linear(self._hp.nz_mid, self._hp.action_dim + 1)
         #)
-        self.p = RecurrentPredictor(self._hp,
+        self.p = RecurrentPredictorTeacherEnforced(self._hp,
+        #TODO: groudn truth actions are incorrect
+        #self.p = RecurrentPredictor(self._hp,
                                           input_size=self._hp.action_dim+1+self._hp.nz_vae,
                                           output_size=self._hp.action_dim + 1)
         self.decoder_input_initalizer = self._build_decoder_initializer(size=self._hp.action_dim + 1)
@@ -79,8 +81,9 @@ class BCMdl(BaseModel):
         output.q = self._run_inference(F.one_hot(self._net_inputs(inputs), num_classes=self._hp.action_dim+1).squeeze(-2).float())
         
         sampled_latent = output.q.rsample()
-
-        output.pred_act = self._compute_output_dist(sampled_latent, cond_inputs=inputs.actions[:, 0], steps=inputs.actions.shape[1]) # outputs logits
+        
+        output.pred_act = self._compute_output_dist(sampled_latent, cond_inputs=inputs.actions[:, 0], steps=inputs.actions.shape[1], gt_output=F.one_hot(inputs.actions.squeeze(-1), num_classes=self._hp.action_dim + 1).float()) # outputs logits
+        #output.pred_act = self._compute_output_dist(sampled_latent, cond_inputs=inputs.actions[:, 0], steps=inputs.actions.shape[1]) # outputs logits
         output.reconstruction = output.pred_act.sample()
         return output
     
@@ -117,13 +120,14 @@ class BCMdl(BaseModel):
         losses.total = self._compute_total_loss(losses)
         return losses
 
-    def _compute_output_dist(self, z, cond_inputs, steps):
+    def _compute_output_dist(self, z, cond_inputs, steps, gt_output=None):
         lstm_init_input = self.decoder_input_initalizer(cond_inputs)
         lstm_init_hidden = self.decoder_hidden_initalizer(cond_inputs)
         decoder_pred = self.p(lstm_initial_inputs=AttrDict(x_t=lstm_init_input),
                                 lstm_static_inputs=AttrDict(z=z),
                                 steps=steps,
-                                lstm_hidden_init=lstm_init_hidden).pred
+                                lstm_hidden_init=lstm_init_hidden,
+                                lstm_gt_output=gt_output).pred
         return torch.distributions.Categorical(logits=decoder_pred)
 
     def _net_inputs(self, inputs):
@@ -174,5 +178,6 @@ class BCMdl(BaseModel):
                 self.val = torch.zeros((1, size), requires_grad=True, device=self._hp.device)
 
             def forward(self, state):
-                return self.val.repeat(find_tensor(state).shape[0], 1)
+                return self.val.repeat(find_tensor(state).shape[0], 1 )
+                #return self.val.repeat(state.shape[0], 1)
         return FixedTrainableInitializer(self._hp)

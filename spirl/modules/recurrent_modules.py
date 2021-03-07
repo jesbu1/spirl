@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from funcsigs import signature
 from spirl.modules.layers import BaseProcessingNet, FCBlock
 from spirl.modules.losses import L2Loss
@@ -66,6 +67,42 @@ class CustomLSTM(nn.Module):
         assert initial_inputs.keys() <= output.keys(), 'Initial inputs are not overridden'
         assert not ((static_inputs.keys() | inputs.keys()) & (output.keys())), 'Inputs are overridden'
 
+class CustomLSTMTeacherEnforced(CustomLSTM):
+    def forward(self, inputs, length, initial_inputs=None, static_inputs=None, teacher_inputs=None):
+        """
+        
+        :param inputs: These are sliced by time. Time is the second dimension
+        :param length: Rollout length
+        :param initial_inputs: These are not sliced and are overridden by cell output
+        :param static_inputs: These are not sliced and can't be overridden by cell output
+        :return:
+        """
+        # NOTE! Unrolling the cell directly will result in crash as the hidden state is not being reset
+        # Use this function or CustomLSTMCell.unroll if needed
+        initial_inputs, static_inputs = self.assert_begin(inputs, initial_inputs, static_inputs)
+
+        step_inputs = initial_inputs.copy()
+        step_inputs.update(static_inputs)
+        lstm_outputs = []
+        for t in range(length):
+            step_inputs.update(map_dict(lambda x: x[:, t], inputs))  # Slicing
+            output = self.cell(**step_inputs)
+            
+            self.assert_post(output, inputs, initial_inputs, static_inputs)
+            # TODO Test what signature does with *args
+            autoregressive_output = subdict(output, output.keys() & signature(self.cell.forward).parameters)
+            autoregressive_output.x_t = F.one_hot(torch.distributions.Categorical(logits=autoregressive_output.x_t.detach()).sample(), num_classes=autoregressive_output.x_t.shape[-1]).float()
+            if teacher_inputs is not None:
+                autoregressive_output.x_t = teacher_inputs[:, t]
+            step_inputs.update(autoregressive_output)
+            lstm_outputs.append(output)
+        
+        # TODO recursively stack outputs
+        lstm_outputs = listdict2dictlist(lstm_outputs)
+        lstm_outputs = map_dict(lambda x: stack(x, dim=1), lstm_outputs)
+            
+        self.cell.reset()
+        return lstm_outputs
 
 class BaseProcessingLSTM(CustomLSTM):
     def __init__(self, hp, in_dim, out_dim):
@@ -189,7 +226,7 @@ class CustomLSTMCell(BaseCell):
         # TODO allow ConvLSTM
         if cell_kwinput:
             cell_input = cell_input + list(zip(*cell_kwinput.items()))[1]
-        
+
         cell_input = concat_inputs(*cell_input)
         inp_extra_dim = list(cell_input.shape[2:])  # This keeps trailing dimensions (should be all shape 1)
         embedded = self.embed(cell_input.view(-1, self.input_size))
@@ -237,6 +274,21 @@ class MaskedLSTMCell(CustomLSTMCell):
         self.hidden_var = self.hidden_var * mask[:, None]
         return super().forward(*cell_input, **cell_kwinput)
 
+class RecurrentPredictorTeacherEnforced(nn.Module):
+    """Recurrent forward prediction module."""
+    def __init__(self, hp, input_size, output_size):
+        super().__init__()
+        self._hp = hp
+        self.cell = ForwardLSTMCell(hp, input_size, output_size)
+        self.lstm = CustomLSTMTeacherEnforced(self.cell)
+
+    def forward(self, lstm_initial_inputs, steps, lstm_inputs=None, lstm_static_inputs=None, lstm_hidden_init=None, lstm_gt_output=None):
+        if lstm_inputs is None:
+            lstm_inputs = {}
+        if lstm_hidden_init is not None:
+            self.cell.hidden_var = lstm_hidden_init     # initialize hidden state of LSTM if given
+        lstm_outputs = self.lstm(lstm_inputs, steps, lstm_initial_inputs, lstm_static_inputs, lstm_gt_output)
+        return AttrDict(pred=lstm_outputs.x_t)
 
 class RecurrentPredictor(nn.Module):
     """Recurrent forward prediction module."""
